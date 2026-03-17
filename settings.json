@@ -1,0 +1,9 @@
+{
+    "announce_track_changes": true,
+    "announcement_channel_id": 964970259104825394,
+    "DJ_role_id": 829065558233579571,
+    "DJ_should_bypass_skip": true,
+    "playback_volume": 0.5,
+    "majority_skip_threshold": 0.51,
+    "audio_file_directory": "."
+}
