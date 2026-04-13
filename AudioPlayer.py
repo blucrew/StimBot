@@ -26,9 +26,11 @@ class AudioPlayer:
         self.track_duration = None
         self.empty_channel_task = None
         self.view_class = None  # Stored so reconnection can restore the control buttons
+        self.reconnecting = False  # True while _autoplay_loop is in its backoff window
         self.allowed_channel_id = 1238177610102472724
         self.admin_user_id = 159290405744017409
-        self.announcement_channel_id = 964970259104825394 # 🎵 New dedicated channel for 'Now Playing' messages
+        self.announcement_channel_id = 1493371526819614983  # 🎵 What's Playing embed channel
+        self.announcement_message = None  # Single embed message to edit
 
     async def send_alert(self, message, severity="INFO"):
         try:
@@ -45,16 +47,44 @@ class AudioPlayer:
         except Exception as e:
             print(f"[AudioPlayer Alert] Failed to send alert: {e}")
 
-    # --- MODIFIED: Sends announcements to the dedicated channel ---
-    async def announce(self, msg):
+    def create_announcement_embed(self):
+        if self.now_playing:
+            embed = discord.Embed(
+                title="🎵 What's Playing",
+                description=f"**{self.now_playing.stem}**",
+                color=discord.Color.gold()
+            )
+            embed.add_field(name="⏰ Time Remaining", value=self.get_remaining_time(), inline=True)
+        else:
+            embed = discord.Embed(
+                title="🎵 What's Playing",
+                description="💤 Nothing currently playing",
+                color=discord.Color.greyple()
+            )
+        return embed
+
+    async def update_announcement(self):
         try:
-            announce_channel = self.bot.get_channel(self.announcement_channel_id)
-            if announce_channel:
-                await announce_channel.send(msg)
-            else:
+            channel = self.bot.get_channel(self.announcement_channel_id)
+            if not channel:
                 print(f"[AudioPlayer] Could not find announcement channel with ID {self.announcement_channel_id}")
+                return
+            embed = self.create_announcement_embed()
+            if self.announcement_message:
+                try:
+                    await self.announcement_message.edit(embed=embed)
+                    return
+                except (discord.NotFound, discord.HTTPException):
+                    self.announcement_message = None
+            # Look for our own existing embed to reuse instead of creating duplicates
+            async for msg in channel.history(limit=20):
+                if msg.author == self.bot.user and msg.embeds:
+                    self.announcement_message = msg
+                    await msg.edit(embed=embed)
+                    return
+            self.announcement_message = await channel.send(embed=embed)
         except Exception as e:
-            print(f"[AudioPlayer] Error in announce: {e}")
+            print(f"[AudioPlayer] Error in update_announcement: {e}")
 
     def get_track_duration(self, file_path):
         try:
@@ -124,7 +154,6 @@ class AudioPlayer:
             except: pass
         self.voice_client = self.embed_message = self.embed_channel = self.loop_task = None
 
-    # --- MODIFIED: Restore the call to self.announce ---
     async def play_file(self, path: Path):
         if not self.voice_client or not self.voice_client.is_connected():
             print(f"[AudioPlayer] play_file: voice client not ready")
@@ -137,10 +166,9 @@ class AudioPlayer:
         self.track_start_time = time.time()
         self.track_duration = self.get_track_duration(path)
         
-        await self.announce(f"⚡ Now playing: **{self.now_playing.stem}**")
-        
         source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(str(path), executable=FFMPEG_EXECUTABLE), volume=self.settings.get("playback_volume"))
         self.voice_client.play(source)
+        await self.update_announcement()
         await self.update_embed()
 
     async def play_random(self):
@@ -161,6 +189,7 @@ class AudioPlayer:
             self.voice_client.stop()
         self.now_playing = self.track_start_time = self.track_duration = None
         self.skip_votes = []
+        await self.update_announcement()
         await self.update_embed()
 
     async def _autoplay_loop(self):
@@ -171,6 +200,7 @@ class AudioPlayer:
             while True:
                 if not self.voice_client or not self.voice_client.is_connected():
                     print("[AudioPlayer] Autoplay loop detected disconnection. Waiting before reconnection...")
+                    self.reconnecting = True
                     reconnect_start_time = time.time()
                     reconnected = False
                     retry_delay = 30  # Start at 30s to let discord.py's own retry logic settle first
@@ -195,6 +225,7 @@ class AudioPlayer:
 
                             allowed_channel = self.bot.get_channel(self.allowed_channel_id)
                             if not allowed_channel:
+                                self.reconnecting = False
                                 await self.send_alert("❌ Could not find Auto Driving channel for reconnection. Loop stopping.", "CRITICAL")
                                 return
 
@@ -208,6 +239,7 @@ class AudioPlayer:
                         except Exception as e:
                             print(f"[AudioPlayer] Reconnection attempt error: {e}")
 
+                    self.reconnecting = False
                     if not reconnected:
                         await self.send_alert("🚨 CRITICAL: Failed to reconnect to voice channel after 10 minutes. Manual intervention required.", "CRITICAL")
                         return
@@ -235,6 +267,7 @@ class AudioPlayer:
                 while self.voice_client and self.voice_client.is_playing():
                     await asyncio.sleep(5)
                     if time.time() - last_embed_update >= 30:
+                        await self.update_announcement()
                         await self.update_embed()
                         last_embed_update = time.time()
                     

@@ -1,12 +1,51 @@
 import os
+import sys
 import asyncio
 import discord
 import time
 import shutil
 import random
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from discord.ext import commands
 from dotenv import load_dotenv
+
+# --- Logging setup -----------------------------------------------------------
+# Mirror everything to stimbot.log (rotating, 5MB x 5) AND stdout so we can
+# diagnose crashes after a Ctrl+C. Replaces prior bare print() calls via a
+# module-level logger; existing print() calls are left in place and captured
+# through a stdout redirect below so nothing is lost.
+LOG_PATH = Path(__file__).parent / "stimbot.log"
+_log_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+_file_handler = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+_file_handler.setFormatter(_log_formatter)
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(_log_formatter)
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler])
+log = logging.getLogger("stimbot")
+
+# Route stray print() output (from AudioPlayer etc.) through the logger too,
+# so the log file captures everything without touching every call site.
+class _PrintToLog:
+    def __init__(self, level=logging.INFO):
+        self._level = level
+        self._buf = ""
+    def write(self, msg):
+        self._buf += msg
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                log.log(self._level, line.rstrip())
+    def flush(self):
+        if self._buf.strip():
+            log.log(self._level, self._buf.rstrip())
+        self._buf = ""
+sys.stdout = _PrintToLog(logging.INFO)
+sys.stderr = _PrintToLog(logging.ERROR)
+# -----------------------------------------------------------------------------
 
 from AudioPlayer import AudioPlayer
 from SettingsManager import SettingsManager
@@ -43,8 +82,26 @@ def check_ffmpeg():
         raise RuntimeError("FFmpeg is not installed or not in PATH, and ffmpeg.exe was not found in the bot directory.")
 
 
+# Alert deduplication: suppress identical (severity, message) alerts within
+# ALERT_DEDUPE_WINDOW seconds. Prevents the 5-min self-check from DM-spamming
+# the admin with the same warning forever.
+ALERT_DEDUPE_WINDOW = 1800  # 30 minutes
+_recent_alerts: dict[tuple, float] = {}
+
 async def send_admin_alert(message, severity="INFO"):
-    """Send alert to admin via DM"""
+    """Send alert to admin via DM (deduped within ALERT_DEDUPE_WINDOW)"""
+    key = (severity, message)
+    now = time.time()
+    last = _recent_alerts.get(key)
+    if last is not None and (now - last) < ALERT_DEDUPE_WINDOW:
+        log.debug(f"[Alert] Suppressed duplicate {severity} alert: {message}")
+        return
+    _recent_alerts[key] = now
+    # Cheap GC so the dict doesn't grow forever
+    if len(_recent_alerts) > 200:
+        for k, t in list(_recent_alerts.items()):
+            if now - t > ALERT_DEDUPE_WINDOW:
+                _recent_alerts.pop(k, None)
     try:
         admin_user = bot.get_user(ADMIN_USER_ID)
         if admin_user:
@@ -103,24 +160,45 @@ async def log_user_interaction(interaction_type: str, user: discord.User, detail
         print(f"[Logging] Error logging user interaction: {e}")
 
 async def run_self_checks():
-    """Run comprehensive self-checks"""
+    """Run comprehensive self-checks (self-heals where possible before alerting)"""
     issues = []
     try:
         if not FFMPEG_PATH.exists() and not shutil.which('ffmpeg'):
             issues.append("❌ FFmpeg not found in PATH")
-        
-        if player.voice_client and not player.voice_client.is_connected():
+
+        # Only warn about "not connected" if the autoplay loop ISN'T already
+        # actively reconnecting — otherwise this fires every 5 min during a
+        # healthy healing window and spams the admin.
+        if player.voice_client and not player.voice_client.is_connected() and not getattr(player, "reconnecting", False):
             issues.append("⚠️ Voice client exists but not connected")
-        
+
         if not scanner.file_cache:
             issues.append("⚠️ No music files in cache - library may need refresh")
-        
+
         if not settings.get('audio_file_directory') or not Path(settings.get('audio_file_directory', '.')).exists():
             issues.append("❌ Audio file directory not configured or does not exist")
-        
-        if player.voice_client and not player.embed_message:
-            issues.append("⚠️ Voice client active but no embed message present")
-        
+
+        # Self-heal missing embed instead of just alerting. This gets wiped to
+        # None whenever update_embed() hits NotFound/HTTPException (e.g. admin
+        # deleted the message, channel purge, transient HTTP error), and prior
+        # behavior was to DM every 5 min forever without fixing it.
+        if player.voice_client and player.voice_client.is_connected() and not player.embed_message:
+            healed = False
+            try:
+                target_channel = player.embed_channel or player.voice_client.channel
+                if target_channel:
+                    effective_view = player.view_class or MusicControlView
+                    player.embed_message = await target_channel.send(
+                        embed=player.create_embed(), view=effective_view()
+                    )
+                    player.embed_channel = target_channel
+                    log.info("[SelfCheck] Self-healed missing embed message")
+                    healed = True
+            except Exception as e:
+                log.warning(f"[SelfCheck] Embed self-heal failed: {e}")
+            if not healed:
+                issues.append("⚠️ Voice client active but no embed message present (self-heal failed)")
+
         if player.voice_client and player.voice_client.is_connected() and not player.loop_task:
             issues.append("🚨 CRITICAL: Voice client connected but autoplay loop not running! (24/7 failure)")
 
@@ -153,65 +231,66 @@ def check_permissions(interaction: discord.Interaction) -> bool:
 player = AudioPlayer(settings, scanner, bot)
 last_public_info = 0
 INFO_COOLDOWN = 900
-poppers_task = None
-poppers_party_mode = False
-poppers_party_end_time = 0
-
-async def send_poppers_prompt():
-    """Send a random poppers prompt to the voice channel's text channel"""
-    try:
-        if not player.voice_client or not player.voice_client.is_connected(): return
-        if not any(not m.bot for m in player.voice_client.channel.members): return
-            
-        text_channel = player.voice_client.channel
-        prompts = [("Hit Em", 1), ("Double hit", 2), ("deep huff", 1)]
-        prompt_text, emoji_count = random.choice(prompts)
-        emoji_string = "<:pp:1405461735539740702>" * emoji_count
-        
-        embed = discord.Embed(
-            title="Party Poppers Time!",
-            description=f"**{prompt_text}** {emoji_string}",
-            color=0xFFD700
-        ).set_footer(text="Get the party started!")
-        
-        message = await text_channel.send(embed=embed)
-        await asyncio.sleep(60)
-        await message.delete()
-            
-    except Exception as e:
-        print(f"[Poppers] CRITICAL ERROR in send_poppers_prompt: {e}")
-        await send_admin_alert(f"Poppers system error: {str(e)}", "ERROR")
-
-async def poppers_prompt_loop():
-    """Main loop for sending poppers prompts - every 4-8 minutes"""
-    global poppers_party_mode, poppers_party_end_time
-    try:
-        while True:
-            if poppers_party_mode and time.time() > poppers_party_end_time:
-                poppers_party_mode = False
-                print("[Poppers] Party mode ended")
-
-            next_prompt = random.randint(240, 480)  # 4-8 minutes
-            await asyncio.sleep(next_prompt)
-            await send_poppers_prompt()
-
-    except asyncio.CancelledError:
-        print("[Poppers] Prompt loop cancelled")
-    except Exception as e:
-        print(f"[Poppers] Error in prompt loop: {e}")
-
-def start_poppers_prompts():
-    global poppers_task
-    if not poppers_task or poppers_task.done():
-        poppers_task = asyncio.create_task(poppers_prompt_loop())
-        print("[Poppers] Prompt system started.")
-
-def stop_poppers_prompts():
-    global poppers_task
-    if poppers_task and not poppers_task.done():
-        poppers_task.cancel()
-        poppers_task = None
-        print("[Poppers] Prompt system stopped.")
+# --- Poppers system disabled (handled by separate bot) ---
+# poppers_task = None
+# poppers_party_mode = False
+# poppers_party_end_time = 0
+#
+# async def send_poppers_prompt():
+#     """Send a random poppers prompt to the voice channel's text channel"""
+#     try:
+#         if not player.voice_client or not player.voice_client.is_connected(): return
+#         if not any(not m.bot for m in player.voice_client.channel.members): return
+#
+#         text_channel = player.voice_client.channel
+#         prompts = [("Hit Em", 1), ("Double hit", 2), ("deep huff", 1)]
+#         prompt_text, emoji_count = random.choice(prompts)
+#         emoji_string = "<:pp:1405461735539740702>" * emoji_count
+#
+#         embed = discord.Embed(
+#             title="Party Poppers Time!",
+#             description=f"**{prompt_text}** {emoji_string}",
+#             color=0xFFD700
+#         ).set_footer(text="Get the party started!")
+#
+#         message = await text_channel.send(embed=embed)
+#         await asyncio.sleep(60)
+#         await message.delete()
+#
+#     except Exception as e:
+#         print(f"[Poppers] CRITICAL ERROR in send_poppers_prompt: {e}")
+#         await send_admin_alert(f"Poppers system error: {str(e)}", "ERROR")
+#
+# async def poppers_prompt_loop():
+#     """Main loop for sending poppers prompts - every 4-8 minutes"""
+#     global poppers_party_mode, poppers_party_end_time
+#     try:
+#         while True:
+#             if poppers_party_mode and time.time() > poppers_party_end_time:
+#                 poppers_party_mode = False
+#                 print("[Poppers] Party mode ended")
+#
+#             next_prompt = random.randint(240, 480)  # 4-8 minutes
+#             await asyncio.sleep(next_prompt)
+#             await send_poppers_prompt()
+#
+#     except asyncio.CancelledError:
+#         print("[Poppers] Prompt loop cancelled")
+#     except Exception as e:
+#         print(f"[Poppers] Error in prompt loop: {e}")
+#
+# def start_poppers_prompts():
+#     global poppers_task
+#     if not poppers_task or poppers_task.done():
+#         poppers_task = asyncio.create_task(poppers_prompt_loop())
+#         print("[Poppers] Prompt system started.")
+#
+# def stop_poppers_prompts():
+#     global poppers_task
+#     if poppers_task and not poppers_task.done():
+#         poppers_task.cancel()
+#         poppers_task = None
+#         print("[Poppers] Prompt system stopped.")
 
 class MusicControlView(discord.ui.View):
     def __init__(self):
@@ -261,40 +340,32 @@ class MusicControlView(discord.ui.View):
             if not interaction.response.is_done():
                 await interaction.response.send_message("❌ Error processing skip request.", ephemeral=True)
 
-async def activate_poppers_party(channel: discord.TextChannel, user: discord.User):
-    """Activates poppers party mode, sends announcements, and alerts admin."""
-    global poppers_party_mode, poppers_party_end_time
-
-    stop_poppers_prompts()
-
-    poppers_party_mode = True
-    poppers_party_end_time = time.time() + 600
-
-    start_poppers_prompts()
-
-    embed = discord.Embed(
-        title="POPPERS PARTY MODE ACTIVATED!",
-        description="Prompts every 4-8 minutes for the next 10 minutes!\n\n<:pp:1405461735539740702> Get ready to party! <:pp:1405461735539740702>",
-        color=0xFF4500
-    ).set_footer(text="Party mode will end automatically in 10 minutes")
-
-    await channel.send(embed=embed)
-    # Fire the first prompt immediately so there's no dead air after activation
-    await send_poppers_prompt()
-    print(f"[Poppers] Party mode activated by {user.display_name}")
-
-@bot.tree.command(name="poppersparty", description="Activate party mode - rapid poppers prompts for 10 minutes")
-async def poppersparty(interaction: discord.Interaction):
-    await log_user_interaction("slash_command", interaction.user, "poppersparty command")
-    if not check_permissions(interaction):
-        return await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-    
-    if poppers_party_mode:
-        return await interaction.response.send_message("Party mode is already active!", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    await activate_poppers_party(interaction.channel, interaction.user)
-    await interaction.followup.send("Party mode activated!", ephemeral=True)
+# async def activate_poppers_party(channel: discord.TextChannel, user: discord.User):
+#     """Activates poppers party mode, sends announcements, and alerts admin."""
+#     global poppers_party_mode, poppers_party_end_time
+#     stop_poppers_prompts()
+#     poppers_party_mode = True
+#     poppers_party_end_time = time.time() + 600
+#     start_poppers_prompts()
+#     embed = discord.Embed(
+#         title="POPPERS PARTY MODE ACTIVATED!",
+#         description="Prompts every 4-8 minutes for the next 10 minutes!\n\n<:pp:1405461735539740702> Get ready to party! <:pp:1405461735539740702>",
+#         color=0xFF4500
+#     ).set_footer(text="Party mode will end automatically in 10 minutes")
+#     await channel.send(embed=embed)
+#     await send_poppers_prompt()
+#     print(f"[Poppers] Party mode activated by {user.display_name}")
+#
+# @bot.tree.command(name="poppersparty", description="Activate party mode - rapid poppers prompts for 10 minutes")
+# async def poppersparty(interaction: discord.Interaction):
+#     await log_user_interaction("slash_command", interaction.user, "poppersparty command")
+#     if not check_permissions(interaction):
+#         return await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+#     if poppers_party_mode:
+#         return await interaction.response.send_message("Party mode is already active!", ephemeral=True)
+#     await interaction.response.defer(ephemeral=True)
+#     await activate_poppers_party(interaction.channel, interaction.user)
+#     await interaction.followup.send("Party mode activated!", ephemeral=True)
 
 
 @bot.tree.command(name="play", description="Start 24/7 music playback in Auto Driving")
@@ -320,7 +391,7 @@ async def stop(interaction: discord.Interaction):
     if not check_permissions(interaction):
         return await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
     await player.stop_loop()
-    await player.announce("Playback stopped.")
+    await player.update_announcement()
     await interaction.response.send_message("Playback stopped.", ephemeral=True)
 
 @bot.tree.command(name="disconnect", description="Disconnect bot from voice channel")
@@ -346,20 +417,15 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    global poppers_party_mode
-    
-    if not player.voice_client or not player.voice_client.is_connected():
-        return
-        
-    if message.channel.id != player.voice_client.channel.id:
-        return
-
-    if not poppers_party_mode:
-        keywords = ['poppers', 'popper', 'pp', 'huff']
-        message_content_lower = message.content.lower()
-        
-        if any(word in message_content_lower for word in keywords):
-            await activate_poppers_party(message.channel, message.author)
+    # --- Poppers keyword detection disabled (handled by separate bot) ---
+    # global poppers_party_mode
+    # if not player.voice_client or not player.voice_client.is_connected(): return
+    # if message.channel.id != player.voice_client.channel.id: return
+    # if not poppers_party_mode:
+    #     keywords = ['poppers', 'popper', 'pp', 'huff']
+    #     message_content_lower = message.content.lower()
+    #     if any(word in message_content_lower for word in keywords):
+    #         await activate_poppers_party(message.channel, message.author)
 
 
 @bot.event
@@ -385,7 +451,7 @@ async def on_ready():
             await player.connect(auto_driving_channel, None, MusicControlView)
             if player.voice_client and player.voice_client.is_connected():
                 print(f"[Startup] Successfully joined {auto_driving_channel.name}")
-                await player.announce("🤖 StimBot online! 24/7 music mode activated.")
+                await player.update_announcement()
             else:
                 print("[Startup] Initial voice connection failed - autoplay loop will retry")
                 await send_admin_alert("⚠️ Failed to connect to voice on startup. Autoplay loop will retry.", "WARNING")
@@ -397,7 +463,7 @@ async def on_ready():
         await send_admin_alert(f"⚠️ Startup voice error: {str(e)}. Autoplay loop will retry.", "WARNING")
 
     player.start_loop()
-    start_poppers_prompts()
+    # start_poppers_prompts()  # Disabled - handled by separate bot
     asyncio.create_task(start_health_monitor())
     await send_admin_alert(f"✅ StimBot started as {bot.user}", "INFO")
     await run_self_checks()

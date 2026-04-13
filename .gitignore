@@ -14,5 +14,8 @@ __pycache__/
 *.pkl
 file_cache.pkl
 
+# Logs
+*.log
+
 # Local Environment Folders
 .claude/
