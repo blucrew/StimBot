@@ -278,10 +278,10 @@ class AudioPlayer:
                 
                 await asyncio.sleep(1)
                 
-                if tracks_played > 0 and tracks_played % 25 == 0:
+                if tracks_played > 0 and tracks_played % 100 == 0:
                     runtime = (time.time() - loop_start_time) / 3600
-                    if runtime > 0.01:
-                        await self.send_alert(f"ℹ️ 24/7 Milestone: {tracks_played} tracks in {runtime:.1f}h", "INFO")
+                    if runtime >= 1.0:  # Only report if we've been running at least an hour
+                        print(f"[AudioPlayer] Milestone: {tracks_played} tracks in {runtime:.1f}h")
                     
         except asyncio.CancelledError:
             print(f"[AudioPlayer] Autoplay loop cancelled after {tracks_played} tracks")
